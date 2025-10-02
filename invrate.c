@@ -61,6 +61,61 @@ static uint64_t find_q_near_pow2(int k, int f, int mode_afs, uint64_t max_tries)
     return 0;
 }
 
+#include <pthread.h>
+
+typedef struct {
+    int64_t B;
+    uint64_t N;
+    uint64_t invertible;
+    int deg;
+    uint64_t q;
+    nmod_poly_t phi;
+    int use_inverse;
+} thread_data_t;
+
+void* thread_worker(void* arg) {
+    thread_data_t* data = (thread_data_t*)arg;
+    nmod_poly_t c, g, inv;
+    nmod_poly_init(c, data->q);
+    nmod_poly_init(g, data->q);
+    nmod_poly_init(inv, data->q);
+
+    nmod_poly_fit_length(c, data->deg);
+    _nmod_poly_set_length(c, data->deg);
+
+    uint64_t local_invertible = 0;
+
+    for (uint64_t it = 0; it < data->N; it++) {
+        for (int i = 0; i < data->deg; i++) {
+            int64_t ai = sample_in_range(data->B);
+            int64_t bi = sample_in_range(data->B);
+            int64_t diff = ai - bi;
+            uint64_t u;
+            if (diff >= 0) u = (uint64_t)diff % data->q;
+            else {
+                uint64_t t = (uint64_t)(-diff) % data->q;
+                u = t ? (data->q - t) : 0;
+            }
+            nmod_poly_set_coeff_ui(c, i, u);
+        }
+
+        if (!data->use_inverse) {
+            nmod_poly_gcd(g, c, data->phi);
+            if (nmod_poly_degree(g) == 0) local_invertible++;
+        } else {
+            if (nmod_poly_invmod(inv, c, data->phi)) local_invertible++;
+        }
+    }
+
+    data->invertible = local_invertible;
+
+    nmod_poly_clear(c);
+    nmod_poly_clear(g);
+    nmod_poly_clear(inv);
+
+    return NULL;
+}
+
 int main(int argc, char** argv){
     // Defaults
     const int deg = 16;       // phi(32)=32
@@ -108,38 +163,37 @@ int main(int argc, char** argv){
            k, q, f, mode_afs ? "AFS" : "FS", N);
     printf("# Columns: B, invertible, N, noninvert_rate, expected_rate\n");
 
-    for (int p = 0; p <= max_powB; p++){
+    for (int p = 0; p <= max_powB; p++) {
         int64_t B = (int64_t)1 << p;
-        uint64_t invertible = 0;
+        uint64_t total_invertible = 0;
+        int num_threads = 4; // Adjust the number of threads as needed
+        pthread_t threads[num_threads];
+        thread_data_t thread_data[num_threads];
 
-        for (uint64_t it = 0; it < N; it++){
-            // Fill coefficients for c(x) with (a-b) ∈ [-2B, 2B], reduced mod q
-            for (int i = 0; i < deg; i++){
-                int64_t ai = sample_in_range(B);
-                int64_t bi = sample_in_range(B);
-                // printf(" // a[%d]=%" PRId64 ", b[%d]=%" PRId64 "\n", i, ai, i, bi);
-                int64_t diff = ai - bi; // in [-2B..2B]
-                uint64_t u;
-                if (diff >= 0) u = (uint64_t)diff % q;
-                else{
-                    uint64_t t = (uint64_t)(-diff) % q;
-                    u = t ? (q - t) : 0;
-                }
-                nmod_poly_set_coeff_ui(c, i, u);
-            }
-            // c length already set; no need to normalise each loop
+        uint64_t trials_per_thread = N / num_threads;
 
-            if (!use_inverse){
-                nmod_poly_gcd(g, c, phi);
-                if (nmod_poly_degree(g) == 0) invertible++;
-            }else{
-                if (nmod_poly_invmod(inv, c, phi)) invertible++;
-            }
+        for (int t = 0; t < num_threads; t++) {
+            thread_data[t].B = B;
+            thread_data[t].N = trials_per_thread;
+            thread_data[t].invertible = 0;
+            thread_data[t].deg = deg;
+            thread_data[t].q = q;
+            thread_data[t].use_inverse = use_inverse;
+            nmod_poly_init(thread_data[t].phi, q);
+            nmod_poly_set(thread_data[t].phi, phi);
+
+            pthread_create(&threads[t], NULL, thread_worker, &thread_data[t]);
         }
 
-        double rate = 1.0 - ((double)invertible / (double)N);
+        for (int t = 0; t < num_threads; t++) {
+            pthread_join(threads[t], NULL);
+            total_invertible += thread_data[t].invertible;
+            nmod_poly_clear(thread_data[t].phi);
+        }
+
+        double rate = 1.0 - ((double)total_invertible / (double)N);
         printf("%" PRId64 ", %" PRIu64 ", %" PRIu64 ", %.10e, %.10e\n",
-               B, invertible, N, rate, expected);
+               B, total_invertible, N, rate, expected);
         fflush(stdout);
     }
 
